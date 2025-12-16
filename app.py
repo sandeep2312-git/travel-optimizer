@@ -5,6 +5,8 @@ from geopy.extra.rate_limiter import RateLimiter
 
 from src.planner import plan_itinerary
 from src.poi_sources_overpass import fetch_pois
+from src.export_pdf import itinerary_to_pdf
+from src.export_ics import itinerary_to_ics
 
 
 # ----------------------------
@@ -88,6 +90,8 @@ def explain_plan(itinerary: dict, prefs: dict, pace: str, travel_mode: str) -> s
 with st.sidebar:
     st.header("1) Trip Inputs")
     city = st.text_input("City", value="Denver, CO")
+    trip_start_date = st.date_input("Trip start date").isoformat()
+
     days = st.slider("Number of days", 1, 7, 3)
     budget = st.number_input("Total budget ($)", min_value=0, value=400, step=50)
 
@@ -154,7 +158,6 @@ df_pois["include"] = True
 st.subheader("✅ Pick the places the optimizer can use")
 st.caption("Uncheck places you don’t like. You can also tweak time/cost so the schedule matches reality.")
 
-# Filters
 c1, c2, c3 = st.columns(3)
 with c1:
     category_filter = st.multiselect(
@@ -186,7 +189,6 @@ edited = st.data_editor(
     key="poi_editor",
 )
 
-# Apply edits back
 df_view.loc[:, "include"] = edited["include"].values
 df_view.loc[:, "avg_cost"] = edited["avg_cost"].values
 df_view.loc[:, "visit_duration_mins"] = edited["visit_duration_mins"].values
@@ -194,13 +196,12 @@ df_view.loc[:, "rating"] = edited["rating"].values
 
 chosen_df = df_view[df_view["include"]].copy()
 
-# Preserve lat/lon (in case view lost them)
+# Preserve lat/lon
 chosen_df = chosen_df.merge(df_pois[["name", "lat", "lon"]], on="name", how="left", suffixes=("", "_orig"))
-chosen_df["lat"] = chosen_df["lat"].fillna(chosen_df.get("lat_orig"))
-chosen_df["lon"] = chosen_df["lon"].fillna(chosen_df.get("lon_orig"))
-
 chosen_pois = chosen_df[["name", "category", "avg_cost", "visit_duration_mins", "rating", "lat", "lon"]].to_dict("records")
+
 st.write(f"Places selected: **{len(chosen_pois)}**")
+
 
 # Map preview
 st.subheader("🗺 Map preview of selected places")
@@ -241,7 +242,7 @@ if generate:
 
     st.info(explain_plan(itinerary, prefs, pace, travel_mode))
 
-    # Display by day: timeline table + cards
+    # Itinerary per day
     for day in itinerary.get("days", []):
         st.markdown("---")
         st.subheader(f"Day {day['day']}  •  Cost: ${day['day_cost']}  •  Time: {day['day_time_mins']} mins")
@@ -251,7 +252,6 @@ if generate:
             st.warning("No activities selected for this day. Try relaxing constraints or selecting more places.")
             continue
 
-        # Timeline table (layman-friendly)
         rows = []
         for i, e in enumerate(timeline, start=1):
             rows.append({
@@ -266,14 +266,38 @@ if generate:
 
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        # Action buttons (maps)
         st.caption("Map links:")
         for i, e in enumerate(timeline, start=1):
             lat_e, lon_e = e.get("lat"), e.get("lon")
             if lat_e is None or lon_e is None:
                 continue
-            st.link_button(f"Open {i}. {e['name']} in Google Maps",
-                           f"https://www.google.com/maps/search/?api=1&query={lat_e},{lon_e}")
+            st.link_button(
+                f"Open {i}. {e['name']} in Google Maps",
+                f"https://www.google.com/maps/search/?api=1&query={lat_e},{lon_e}"
+            )
+
+    # ----------------------------
+    # Export
+    # ----------------------------
+    st.markdown("---")
+    st.subheader("⬇️ Export")
+
+    safe_city = city.replace(" ", "_").replace(",", "")
+    pdf_bytes = itinerary_to_pdf(itinerary, title=f"Itinerary for {city}")
+    st.download_button(
+        "Download PDF",
+        data=pdf_bytes,
+        file_name=f"itinerary_{safe_city}.pdf",
+        mime="application/pdf",
+    )
+
+    ics_bytes = itinerary_to_ics(itinerary, trip_start_date=trip_start_date)
+    st.download_button(
+        "Download Calendar (.ics)",
+        data=ics_bytes,
+        file_name=f"itinerary_{safe_city}.ics",
+        mime="text/calendar",
+    )
 
     with st.expander("🔧 Debug: Raw itinerary JSON"):
         st.json(itinerary)
