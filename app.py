@@ -21,6 +21,25 @@ CITY_PRESETS = {
     "Seattle, WA": (47.6062, -122.3321),
 }
 
+# Expand categories (UI-level). Your Overpass fetcher must supply these categories to fully use them.
+ALL_CATEGORIES = [
+    "nature",
+    "food",
+    "museums",
+    "nightlife",
+    "coffee",
+    "shopping",
+    "viewpoints",
+    "events",
+]
+
+# For special modes
+MODE_CONFIG = {
+    "Full day": {"start_hour": None, "pace": None, "force_categories": None},
+    "Evening outing only": {"start_hour": 17, "pace": "relaxed", "force_categories": ["nature", "museums", "events", "nightlife"]},
+    "Night dinner only": {"start_hour": 19, "pace": "relaxed", "force_categories": ["food", "nightlife", "coffee"]},
+}
+
 
 # ----------------------------
 # Page setup
@@ -57,7 +76,6 @@ def geocode_city(city: str):
 
 @st.cache_data(show_spinner=False)
 def load_pois_cached(lat: float, lon: float, radius_km: float, limit: int, relaxed: bool):
-    # IMPORTANT: uses relaxed tags + fallback strategy inside poi_sources_overpass.py
     return fetch_pois(lat=lat, lon=lon, radius_km=radius_km, limit=limit, relaxed=relaxed)
 
 
@@ -82,7 +100,6 @@ def normalize_poi_defaults(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["name", "lat", "lon"]).copy()
     df["lat"] = df["lat"].astype(float)
     df["lon"] = df["lon"].astype(float)
-
     return df
 
 
@@ -94,19 +111,80 @@ def fmt_time(mins: int) -> str:
     return f"{hh}:{m:02d} {ampm}"
 
 
-def explain_plan(itinerary: dict, prefs: dict, pace: str, travel_mode: str) -> str:
+def explain_plan(itinerary: dict, selected_categories: list[str], pace: str, travel_mode: str, mode: str) -> str:
     if not itinerary.get("days"):
-        return "I couldn’t build an itinerary with the current constraints. Try selecting more places, increasing budget, or choosing a relaxed pace."
+        return "I couldn’t build an itinerary with the current constraints. Try selecting more places, increasing budget, or switching to Full day."
 
-    top_pref = max(prefs.items(), key=lambda x: x[1])[0]
+    cats = ", ".join(selected_categories) if selected_categories else "all categories"
     total_cost = itinerary.get("total_cost", 0)
     remaining = itinerary.get("remaining_budget", 0)
 
     return (
-        f"This plan uses {travel_mode} travel mode and a {pace} pace. "
-        f"It prioritizes {top_pref} based on your interest sliders and tries to keep stops closer together to reduce travel time. "
-        f"Estimated spend is ${total_cost}, leaving about ${remaining} as buffer for meals, tickets, and extras."
+        f"Mode: {mode}. Travel: {travel_mode}. Pace: {pace}. "
+        f"Included categories: {cats}. "
+        f"Estimated spend is ${total_cost}, leaving about ${remaining} as buffer."
     )
+
+
+def parse_must_visits(text: str) -> list[str]:
+    if not text.strip():
+        return []
+    # split by comma or newline
+    raw = text.replace("\n", ",")
+    items = [x.strip() for x in raw.split(",")]
+    return [x for x in items if x]
+
+
+def apply_editor_edits(master: pd.DataFrame, edited: pd.DataFrame) -> pd.DataFrame:
+    """
+    Update master using edited rows by name (and keep coordinates).
+    Edited should have at least: include, name, avg_cost, visit_duration_mins, rating
+    """
+    m = master.copy()
+    idx_map = {n: i for i, n in enumerate(m["name"].tolist())}
+
+    for _, row in edited.iterrows():
+        n = str(row["name"])
+        if n in idx_map:
+            i = idx_map[n]
+            if "include" in row:
+                m.at[i, "include"] = bool(row["include"])
+            if "avg_cost" in row:
+                m.at[i, "avg_cost"] = float(row["avg_cost"])
+            if "visit_duration_mins" in row:
+                m.at[i, "visit_duration_mins"] = int(row["visit_duration_mins"])
+            if "rating" in row:
+                m.at[i, "rating"] = float(row["rating"])
+    return m
+
+
+def prefs_from_categories(selected_categories: list[str]) -> dict:
+    """
+    Convert checkbox categories into a prefs dict the planner already expects.
+    Selected => 1.0, not selected => 0.2
+    """
+    base = 0.2
+    prefs = {}
+    for c in ["nature", "food", "museums", "nightlife"]:
+        prefs[c] = 1.0 if c in selected_categories else base
+    return prefs
+
+
+def reorder_with_must_visits(pois: list[dict], must_visits: list[str]) -> list[dict]:
+    """
+    Heuristic: if POI name contains a must-visit phrase, move those POIs to the front.
+    """
+    if not must_visits:
+        return pois
+
+    def match_score(name: str) -> int:
+        name_l = name.lower()
+        for mv in must_visits:
+            if mv.lower() in name_l:
+                return 1
+        return 0
+
+    return sorted(pois, key=lambda p: match_score(p.get("name", "")), reverse=True)
 
 
 # ----------------------------
@@ -118,28 +196,61 @@ with st.sidebar:
     city = st.text_input("City (optional if preset selected)", value="Denver, CO")
     trip_start_date = st.date_input("Trip start date").isoformat()
 
+    mode = st.selectbox("Trip style", list(MODE_CONFIG.keys()), index=0)
+
     days = st.slider("Number of days", 1, 7, 3)
     budget = st.number_input("Total budget ($)", min_value=0, value=400, step=50)
 
-    start_hour = st.slider("Day starts at", 6, 12, 10)
-    pace = st.selectbox("Pace", ["relaxed", "moderate", "packed"], index=1)
     travel_mode = st.selectbox("Travel mode", ["drive", "transit", "walk"], index=0)
 
     st.divider()
-    st.header("2) Place Search")
-    radius_km = st.slider("Search radius (km)", 2, 30, 10)  # a bit higher helps Denver
+    st.header("2) Time preferences")
+    # Default start time depends on mode, but allow override for Full day
+    if MODE_CONFIG[mode]["start_hour"] is None:
+        start_hour = st.slider("Day starts at", 6, 12, 10)
+    else:
+        start_hour = MODE_CONFIG[mode]["start_hour"]
+        st.caption(f"Start time is set to {start_hour}:00 for this mode.")
+
+    # Pace: default based on mode, but allow changing for Full day
+    if MODE_CONFIG[mode]["pace"] is None:
+        pace = st.selectbox("Pace", ["relaxed", "moderate", "packed"], index=1)
+    else:
+        pace = MODE_CONFIG[mode]["pace"]
+        st.caption(f"Pace is set to {pace} for this mode.")
+
+    st.divider()
+    st.header("3) Interests (no weights)")
+    selected_categories = st.multiselect(
+        "What do you want to include?",
+        options=ALL_CATEGORIES,
+        default=["nature", "food", "museums", "nightlife"],
+    )
+
+    st.divider()
+    st.header("4) Must-visit places")
+    must_visit_text = st.text_area(
+        "Type specific places (comma or new line). Example: Red Rocks, Denver Art Museum",
+        height=90
+    )
+    must_visits = parse_must_visits(must_visit_text)
+
+    st.divider()
+    st.header("5) Place Search")
+    radius_km = st.slider("Search radius (km)", 2, 30, 10)
     max_pois = st.slider("Max places to load", 30, 250, 120, step=10)
     relaxed_tags = st.checkbox("Relax place matching (recommended)", value=True)
     force_refresh = st.checkbox("Force refresh places (ignore cache)", value=False)
 
-    st.divider()
-    st.header("3) Interests (weights)")
-    nature = st.slider("Nature", 0.0, 1.0, 0.6)
-    food = st.slider("Food", 0.0, 1.0, 0.6)
-    museums = st.slider("Museums", 0.0, 1.0, 0.4)
-    nightlife = st.slider("Nightlife", 0.0, 1.0, 0.2)
 
-prefs = {"nature": nature, "food": food, "museums": museums, "nightlife": nightlife}
+# Apply mode category forcing
+forced = MODE_CONFIG[mode]["force_categories"]
+if forced:
+    # Keep only those categories (intersection), but if user picked none, use forced default
+    if selected_categories:
+        selected_categories = [c for c in selected_categories if c in forced]
+    if not selected_categories:
+        selected_categories = forced
 
 
 # ----------------------------
@@ -196,82 +307,81 @@ with st.spinner("Loading places nearby (OpenStreetMap)…"):
 
 if not pois:
     st.warning("No places found.")
-    st.info(
-        "Try this:\n"
-        "- Increase radius to 12–20 km\n"
-        "- Turn ON “Relax place matching”\n"
-        "- Reduce max places to 80–120\n"
-        "- Click “Force refresh places”"
-    )
     st.stop()
 
 df_pois = normalize_poi_defaults(pd.DataFrame(pois))
-df_pois["include"] = True
+
+# normalize category naming a bit (optional)
+df_pois["category"] = df_pois["category"].replace({"museum": "museums"})
+
+# only show categories we support in UI; everything else becomes "other"
+df_pois.loc[~df_pois["category"].isin(ALL_CATEGORIES), "category"] = "other"
+
+# Default include based on selected categories
+df_pois["include"] = df_pois["category"].isin(selected_categories)
+
+# If mode is "Night dinner only", default include only food/nightlife/coffee
+if mode == "Night dinner only":
+    df_pois["include"] = df_pois["category"].isin(["food", "nightlife", "coffee"])
 
 
 # ----------------------------
-# Curate POIs
+# Category browsing in separate columns/tabs
 # ----------------------------
-st.subheader("✅ Pick the places the optimizer can use")
-st.caption("Uncheck places you don’t like. You can also tweak time/cost so the schedule matches reality.")
+st.subheader("✅ Browse places by category")
+st.caption("Each tab shows places from that category. Toggle “Use” to include/exclude.")
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    category_filter = st.multiselect(
-        "Filter by category",
-        options=sorted(df_pois["category"].unique().tolist()),
-        default=sorted(df_pois["category"].unique().tolist()),
+tabs = st.tabs(["All"] + [c.capitalize() for c in ALL_CATEGORIES] + ["Other"])
+
+def editor_for(df_master: pd.DataFrame, category: str | None, key: str) -> pd.DataFrame:
+    if category is None:
+        df_view = df_master.copy()
+    elif category == "other":
+        df_view = df_master[df_master["category"] == "other"].copy()
+    else:
+        df_view = df_master[df_master["category"] == category].copy()
+
+    if df_view.empty:
+        st.info("No places found in this category.")
+        return df_master
+
+    edited = st.data_editor(
+        df_view[["include", "name", "category", "avg_cost", "visit_duration_mins", "rating"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "include": st.column_config.CheckboxColumn("Use"),
+            "avg_cost": st.column_config.NumberColumn("Avg Cost ($)", min_value=0, max_value=500, step=1),
+            "visit_duration_mins": st.column_config.NumberColumn("Time (mins)", min_value=15, max_value=480, step=15),
+            "rating": st.column_config.NumberColumn("Rating", min_value=0.0, max_value=5.0, step=0.1),
+        },
+        key=key,
     )
-with c2:
-    max_cost_filter = st.slider("Max cost per place ($)", 0, 200, 60)
-with c3:
-    min_rating_filter = st.slider("Min rating (heuristic)", 0.0, 5.0, 4.0, 0.1)
+    return apply_editor_edits(df_master, edited)
 
-df_view = df_pois[
-    (df_pois["category"].isin(category_filter))
-    & (df_pois["avg_cost"] <= max_cost_filter)
-    & (df_pois["rating"] >= min_rating_filter)
-].copy()
+with tabs[0]:
+    df_pois = editor_for(df_pois, None, "editor_all")
 
-edited = st.data_editor(
-    df_view[["include", "name", "category", "avg_cost", "visit_duration_mins", "rating"]],
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "include": st.column_config.CheckboxColumn("Use"),
-        "avg_cost": st.column_config.NumberColumn("Avg Cost ($)", min_value=0, max_value=500, step=1),
-        "visit_duration_mins": st.column_config.NumberColumn("Time (mins)", min_value=15, max_value=480, step=15),
-        "rating": st.column_config.NumberColumn("Rating", min_value=0.0, max_value=5.0, step=0.1),
-    },
-    key="poi_editor",
-)
+for i, cat in enumerate(ALL_CATEGORIES, start=1):
+    with tabs[i]:
+        df_pois = editor_for(df_pois, cat, f"editor_{cat}")
 
-df_view.loc[:, "include"] = edited["include"].values
-df_view.loc[:, "avg_cost"] = edited["avg_cost"].values
-df_view.loc[:, "visit_duration_mins"] = edited["visit_duration_mins"].values
-df_view.loc[:, "rating"] = edited["rating"].values
+with tabs[len(ALL_CATEGORIES) + 1]:
+    df_pois = editor_for(df_pois, "other", "editor_other")
 
-chosen_df = df_view[df_view["include"]].copy()
 
-# Merge back lat/lon safely and prefer non-null values
-chosen_df = chosen_df.merge(df_pois[["name", "lat", "lon"]], on="name", how="left", suffixes=("", "_orig"))
-if "lat_orig" in chosen_df.columns:
-    chosen_df["lat"] = chosen_df["lat"].fillna(chosen_df["lat_orig"])
-if "lon_orig" in chosen_df.columns:
-    chosen_df["lon"] = chosen_df["lon"].fillna(chosen_df["lon_orig"])
+# Summary + map
+chosen_df = df_pois[df_pois["include"]].copy()
 chosen_df = chosen_df.dropna(subset=["lat", "lon"]).copy()
 
 chosen_pois = chosen_df[["name", "category", "avg_cost", "visit_duration_mins", "rating", "lat", "lon"]].to_dict("records")
 st.write(f"Places selected: {len(chosen_pois)}")
 
-
-# Map preview
 st.subheader("🗺 Map preview of selected places")
-map_df = pd.DataFrame([{"lat": p["lat"], "lon": p["lon"]} for p in chosen_pois])
-if not map_df.empty:
-    st.map(map_df)
+if chosen_pois:
+    st.map(pd.DataFrame([{"lat": p["lat"], "lon": p["lon"]} for p in chosen_pois]))
 else:
-    st.info("No mappable points selected.")
+    st.info("No places selected.")
 
 
 # ----------------------------
@@ -281,9 +391,22 @@ st.subheader("📅 Generate itinerary")
 generate = st.button("Build my itinerary", type="primary")
 
 if generate:
-    if len(chosen_pois) < 5:
+    if len(chosen_pois) < 5 and mode != "Night dinner only":
         st.warning("Select at least ~5 places so the planner has enough options.")
         st.stop()
+
+    # Convert selected categories into planner prefs (no weights UI)
+    prefs = prefs_from_categories(selected_categories)
+
+    # Must-visits: push them to the front so planner tends to pick them
+    chosen_pois = reorder_with_must_visits(chosen_pois, must_visits)
+
+    # For night dinner only, reduce how “busy” it is by forcing relaxed pace
+    if mode == "Night dinner only":
+        pace_run = "relaxed"
+        # Also reduce days to 1 if user wants one evening plan (optional; keeping days as chosen)
+    else:
+        pace_run = pace
 
     with st.spinner("Optimizing your itinerary (including travel time)..."):
         itinerary = plan_itinerary(
@@ -291,7 +414,7 @@ if generate:
             days=int(days),
             budget=float(budget),
             prefs=prefs,
-            pace=pace,
+            pace=pace_run,
             start_hour=int(start_hour),
             travel_mode=travel_mode,
         )
@@ -301,16 +424,7 @@ if generate:
     m2.metric("Remaining Budget", f"${itinerary.get('remaining_budget', 0)}")
     m3.metric("Total Time (activities + travel)", f"{itinerary.get('total_time_mins', 0)} mins")
 
-    st.info(explain_plan(itinerary, prefs, pace, travel_mode), icon="ℹ️")
-
-    # Timeline sanity debug (optional)
-    with_coords = sum(
-        1
-        for d in itinerary.get("days", [])
-        for e in d.get("timeline", [])
-        if e.get("lat") is not None and e.get("lon") is not None
-    )
-    st.caption(f"Debug: timeline items with coordinates = {with_coords}")
+    st.info(explain_plan(itinerary, selected_categories, pace_run, travel_mode, mode), icon="ℹ️")
 
     for day in itinerary.get("days", []):
         st.markdown("---")
@@ -318,7 +432,7 @@ if generate:
 
         timeline = day.get("timeline", [])
         if not timeline:
-            st.warning("No activities selected for this day. Try relaxing constraints or selecting more places.")
+            st.warning("No activities selected for this day.")
             continue
 
         rows = []
@@ -328,8 +442,7 @@ if generate:
                 "Time": f"{fmt_time(int(e['start_min']))} → {fmt_time(int(e['end_min']))}",
                 "Place": e["name"],
                 "Category": e["category"],
-                "Travel from prev (mins)": int(e.get("travel_from_prev_mins", 0)),
-                "Travel from prev (km)": round(float(e.get("travel_from_prev_km", 0.0)), 2),
+                "Travel (mins)": int(e.get("travel_from_prev_mins", 0)),
                 "Est. Cost ($)": round(float(e.get("avg_cost", 0.0)), 2),
             })
 
@@ -347,8 +460,7 @@ if generate:
                 f"https://www.google.com/maps/search/?api=1&query={lat_e},{lon_e}",
             )
         if not any_link:
-            st.info("No map links available (missing coordinates). Try selecting different places or reducing filters.")
-
+            st.info("No map links available (missing coordinates).")
 
     st.markdown("---")
     st.subheader("⬇️ Export")
