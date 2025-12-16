@@ -113,7 +113,6 @@ def parse_must_visits(text: str) -> list[str]:
 
 
 def prefs_from_categories(selected: list[str]) -> dict:
-    # planner expects these keys; selected => 1.0 else 0.2
     base = 0.2
     return {
         "nature": 1.0 if "nature" in selected else base,
@@ -134,16 +133,25 @@ def reorder_with_must_visits(pois: list[dict], must_visits: list[str]) -> list[d
     return sorted(pois, key=lambda p: hit(p.get("name", "")), reverse=True)
 
 
-def widget_key(prefix: str, row: pd.Series) -> str:
-    # Unique even for repeated names like Starbucks
-    return (
-        f"{prefix}_{row.get('category','')}_{row.get('name','')}"
-        f"_{float(row.get('lat',0)):.5f}_{float(row.get('lon',0)):.5f}"
+# --- NEW: unique widget id ---
+def add_uid_column(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["_uid"] = (
+        df["name"].astype(str)
+        + "|" + df["category"].astype(str)
+        + "|" + df["lat"].round(6).astype(str)
+        + "|" + df["lon"].round(6).astype(str)
+        + "|" + df.index.astype(str)
     )
+    return df
 
 
-def place_mask(df: pd.DataFrame, row: pd.Series):
-    return (df["name"] == row["name"]) & (df["lat"] == float(row["lat"])) & (df["lon"] == float(row["lon"]))
+def widget_key(prefix: str, row: pd.Series) -> str:
+    return f"{prefix}_{row.get('_uid', '')}"
+
+
+def uid_mask(df: pd.DataFrame, row: pd.Series):
+    return df["_uid"] == row["_uid"]
 
 
 def place_card(row: pd.Series):
@@ -290,9 +298,12 @@ df = normalize_poi_defaults(pd.DataFrame(pois))
 df["category"] = df["category"].where(df["category"].isin(ALL_CATEGORIES), "other")
 df["include"] = False  # nothing auto-selected
 
+# add stable unique widget IDs
+df = add_uid_column(df)
+
 
 # ----------------------------
-# Browse UI (NEW: category tabs + paginated card grid)
+# Browse UI (Tabs + pagination)
 # ----------------------------
 st.subheader("🧩 Pick places by category")
 st.caption("Choose a category, search, then select places. Use Select/Clear to manage fast.")
@@ -305,6 +316,9 @@ df_show["category"] = df_show["category"].where(df_show["category"].isin(ALL_CAT
 # If user selected categories, restrict the browse list to those (otherwise show all)
 if selected_categories:
     df_show = df_show[df_show["category"].isin(selected_categories)].copy()
+
+# IMPORTANT: remove duplicates so keys don't repeat
+df_show = df_show.drop_duplicates(subset=["name", "category", "lat", "lon"]).reset_index(drop=True)
 
 counts = df_show["category"].value_counts().to_dict()
 
@@ -345,13 +359,13 @@ def render_category(dfx: pd.DataFrame, cat_key: str):
     with top[0]:
         if st.button("✅ Select all (this category)", key=f"select_all_{cat_key}"):
             for _, r in dfx.iterrows():
-                df.loc[place_mask(df, r), "include"] = True
+                df.loc[uid_mask(df, r), "include"] = True
             st.rerun()
 
     with top[1]:
         if st.button("🧹 Clear (this category)", key=f"clear_cat_{cat_key}"):
             for _, r in dfx.iterrows():
-                df.loc[place_mask(df, r), "include"] = False
+                df.loc[uid_mask(df, r), "include"] = False
             st.rerun()
 
     with top[2]:
@@ -359,7 +373,6 @@ def render_category(dfx: pd.DataFrame, cat_key: str):
 
     st.markdown("---")
 
-    # Pagination to avoid long pages
     page_size = 16
     total = len(dfx)
     max_pages = max(1, (total - 1) // page_size + 1)
@@ -373,9 +386,12 @@ def render_category(dfx: pd.DataFrame, cat_key: str):
     for idx, (_, r) in enumerate(dfx.iloc[start:end].iterrows()):
         col = left if idx % 2 == 0 else right
         with col:
-            current = bool(df.loc[place_mask(df, r), "include"].values[0])
+            current_vals = df.loc[uid_mask(df, r), "include"].values
+            current = bool(current_vals[0]) if len(current_vals) else False
+
             use = st.checkbox(f"Use: {r['name']}", value=current, key=widget_key("use", r))
-            df.loc[place_mask(df, r), "include"] = bool(use)
+            df.loc[uid_mask(df, r), "include"] = bool(use)
+
             place_card(r)
             st.divider()
 
@@ -405,7 +421,7 @@ if len(chosen_pois) > 0:
     with st.expander("Manage selected places"):
         for _, r in chosen_df.iterrows():
             if st.button(f"Remove: {r['name']}", key=widget_key("rm", r)):
-                df.loc[place_mask(df, r), "include"] = False
+                df.loc[uid_mask(df, r), "include"] = False
                 st.rerun()
 else:
     st.info("Select a few places to build an itinerary.")
