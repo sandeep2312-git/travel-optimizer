@@ -9,12 +9,25 @@ from src.export_pdf import itinerary_to_pdf
 from src.export_ics import itinerary_to_ics
 
 
+CITY_PRESETS = {
+    "— Select a preset (recommended) —": None,
+    "Denver, CO": (39.7392, -104.9903),
+    "Dallas, TX": (32.7767, -96.7970),
+    "Austin, TX": (30.2672, -97.7431),
+    "New York, NY": (40.7128, -74.0060),
+    "San Francisco, CA": (37.7749, -122.4194),
+    "Los Angeles, CA": (34.0522, -118.2437),
+    "Chicago, IL": (41.8781, -87.6298),
+    "Seattle, WA": (47.6062, -122.3321),
+}
+
+
 # ----------------------------
 # Page setup
 # ----------------------------
 st.set_page_config(page_title="AI Travel Optimizer", layout="wide")
 st.title("🧭 AI Travel Optimizer")
-st.caption("A layman-friendly itinerary builder that balances **time, budget, distance, and your interests**.")
+st.caption("A layman-friendly itinerary builder that balances time, budget, distance, and your interests.")
 
 
 # ----------------------------
@@ -22,12 +35,6 @@ st.caption("A layman-friendly itinerary builder that balances **time, budget, di
 # ----------------------------
 @st.cache_data(show_spinner=False)
 def geocode_city(city: str):
-    """
-    Robust geocoding for Codespaces:
-    - Uses Nominatim via geopy
-    - Tries multiple query variants
-    - Retries a few times to handle transient failures/rate-limits
-    """
     geolocator = Nominatim(user_agent="travel-optimizer-app (github-codespace)")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.2)
 
@@ -38,7 +45,7 @@ def geocode_city(city: str):
     ]
 
     for q in queries:
-        for _ in range(3):  # retries
+        for _ in range(3):
             try:
                 loc = geocode(q)
                 if loc:
@@ -96,9 +103,9 @@ def explain_plan(itinerary: dict, prefs: dict, pace: str, travel_mode: str) -> s
     remaining = itinerary.get("remaining_budget", 0)
 
     return (
-        f"This plan uses **{travel_mode}** travel mode and a **{pace}** pace. "
-        f"It prioritizes **{top_pref}** based on your sliders and tries to keep stops **closer together** to reduce travel time. "
-        f"Estimated spend is **${total_cost}**, leaving **${remaining}** buffer for meals, tickets, and extras."
+        f"This plan uses {travel_mode} travel mode and a {pace} pace. "
+        f"It prioritizes {top_pref} based on your interest sliders and tries to keep stops closer together to reduce travel time. "
+        f"Estimated spend is ${total_cost}, leaving about ${remaining} as buffer for meals, tickets, and extras."
     )
 
 
@@ -107,7 +114,8 @@ def explain_plan(itinerary: dict, prefs: dict, pace: str, travel_mode: str) -> s
 # ----------------------------
 with st.sidebar:
     st.header("1) Trip Inputs")
-    city = st.text_input("City", value="Denver, CO")
+    preset = st.selectbox("City preset", list(CITY_PRESETS.keys()), index=1)
+    city = st.text_input("City (optional if preset selected)", value="Denver, CO")
     trip_start_date = st.date_input("Trip start date").isoformat()
 
     days = st.slider("Number of days", 1, 7, 3)
@@ -119,7 +127,7 @@ with st.sidebar:
 
     st.divider()
     st.header("2) Place Search")
-    radius_km = st.slider("Search radius (km)", 2, 30, 8)
+    radius_km = st.slider("Search radius (km)", 2, 30, 6)
     max_pois = st.slider("Max places to load", 30, 250, 120, step=10)
     force_refresh = st.checkbox("Force refresh places (ignore cache)", value=False)
 
@@ -134,12 +142,18 @@ prefs = {"nature": nature, "food": food, "museums": museums, "nightlife": nightl
 
 
 # ----------------------------
-# Geocode (with manual fallback)
+# Geocode (preset -> geocode -> manual)
 # ----------------------------
 coords = None
-if city.strip():
-    with st.spinner("Finding your city on the map..."):
-        coords = geocode_city(city.strip())
+city_display = city.strip()
+
+if CITY_PRESETS.get(preset):
+    coords = CITY_PRESETS[preset]
+    city_display = preset
+else:
+    if city_display:
+        with st.spinner("Finding your city on the map..."):
+            coords = geocode_city(city_display)
 
 if not coords:
     st.warning("City lookup failed (geocoding). You can still continue by entering coordinates manually.")
@@ -151,7 +165,7 @@ if not coords:
     st.info("Tip: In Google Maps, right-click → 'What's here?' to copy coordinates.")
 else:
     lat, lon = coords
-    st.success(f"Location found: **{city}**  (lat: {lat:.4f}, lon: {lon:.4f})")
+    st.success(f"Location set: {city_display} (lat: {lat:.4f}, lon: {lon:.4f})")
 
 
 # ----------------------------
@@ -168,7 +182,7 @@ with st.spinner("Loading places nearby (OpenStreetMap)…"):
         st.stop()
 
 if not pois:
-    st.warning("No places found. Try increasing radius or changing the city.")
+    st.warning("No places found. Try reducing radius or changing the city.")
     st.stop()
 
 df_pois = normalize_poi_defaults(pd.DataFrame(pois))
@@ -219,11 +233,17 @@ df_view.loc[:, "rating"] = edited["rating"].values
 
 chosen_df = df_view[df_view["include"]].copy()
 
-# Preserve lat/lon
+# Merge back lat/lon safely and prefer non-null values
 chosen_df = chosen_df.merge(df_pois[["name", "lat", "lon"]], on="name", how="left", suffixes=("", "_orig"))
+if "lat_orig" in chosen_df.columns:
+    chosen_df["lat"] = chosen_df["lat"].fillna(chosen_df["lat_orig"])
+if "lon_orig" in chosen_df.columns:
+    chosen_df["lon"] = chosen_df["lon"].fillna(chosen_df["lon_orig"])
+chosen_df = chosen_df.dropna(subset=["lat", "lon"]).copy()
+
 chosen_pois = chosen_df[["name", "category", "avg_cost", "visit_duration_mins", "rating", "lat", "lon"]].to_dict("records")
 
-st.write(f"Places selected: **{len(chosen_pois)}**")
+st.write(f"Places selected: {len(chosen_pois)}")
 
 
 # Map preview
@@ -257,18 +277,25 @@ if generate:
             travel_mode=travel_mode,
         )
 
-    # Summary metrics
     m1, m2, m3 = st.columns(3)
     m1.metric("Estimated Total Cost", f"${itinerary.get('total_cost', 0)}")
     m2.metric("Remaining Budget", f"${itinerary.get('remaining_budget', 0)}")
     m3.metric("Total Time (activities + travel)", f"{itinerary.get('total_time_mins', 0)} mins")
 
-    st.info(explain_plan(itinerary, prefs, pace, travel_mode))
+    st.info(explain_plan(itinerary, prefs, pace, travel_mode), icon="ℹ️")
 
-    # Itinerary per day
+    # quick sanity debug (optional)
+    with_coords = sum(
+        1
+        for d in itinerary.get("days", [])
+        for e in d.get("timeline", [])
+        if e.get("lat") is not None and e.get("lon") is not None
+    )
+    st.caption(f"Debug: timeline items with coordinates = {with_coords}")
+
     for day in itinerary.get("days", []):
         st.markdown("---")
-        st.subheader(f"Day {day['day']}  •  Cost: ${day['day_cost']}  •  Time: {day['day_time_mins']} mins")
+        st.subheader(f"Day {day['day']} • Cost: ${day['day_cost']} • Time: {day['day_time_mins']} mins")
 
         timeline = day.get("timeline", [])
         if not timeline:
@@ -290,23 +317,25 @@ if generate:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         st.caption("Map links:")
+        any_link = False
         for i, e in enumerate(timeline, start=1):
             lat_e, lon_e = e.get("lat"), e.get("lon")
             if lat_e is None or lon_e is None:
                 continue
+            any_link = True
             st.link_button(
                 f"Open {i}. {e['name']} in Google Maps",
                 f"https://www.google.com/maps/search/?api=1&query={lat_e},{lon_e}"
             )
+        if not any_link:
+            st.info("No map links available (missing coordinates). Try selecting different places or reducing filters.")
 
-    # ----------------------------
-    # Export
-    # ----------------------------
+
     st.markdown("---")
     st.subheader("⬇️ Export")
 
-    safe_city = city.replace(" ", "_").replace(",", "")
-    pdf_bytes = itinerary_to_pdf(itinerary, title=f"Itinerary for {city}")
+    safe_city = (city_display or "trip").replace(" ", "_").replace(",", "")
+    pdf_bytes = itinerary_to_pdf(itinerary, title=f"Itinerary for {city_display or 'Trip'}")
     st.download_button(
         "Download PDF",
         data=pdf_bytes,
