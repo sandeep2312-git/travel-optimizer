@@ -25,11 +25,18 @@ ALL_CATEGORIES = ["food", "nature", "museums", "nightlife", "coffee", "shopping"
 
 MODE_CONFIG = {
     "Full day": {"start_hour": None, "pace": None, "force_categories": None},
-    "Evening outing only": {"start_hour": 17, "pace": "relaxed", "force_categories": ["nature", "museums", "events", "nightlife", "viewpoints"]},
+    "Evening outing only": {
+        "start_hour": 17,
+        "pace": "relaxed",
+        "force_categories": ["nature", "museums", "events", "nightlife", "viewpoints"],
+    },
     "Night dinner only": {"start_hour": 19, "pace": "relaxed", "force_categories": ["food", "nightlife", "coffee"]},
 }
 
 
+# ----------------------------
+# Page setup
+# ----------------------------
 st.set_page_config(page_title="AI Travel Optimizer", layout="wide")
 st.title("🧭 AI Travel Optimizer")
 st.caption("Pick what you want (no weights), then generate a simple schedule + map links + exports.")
@@ -86,7 +93,6 @@ def normalize_poi_defaults(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["name", "lat", "lon"]).copy()
     df["lat"] = df["lat"].astype(float)
     df["lon"] = df["lon"].astype(float)
-
     return df
 
 
@@ -107,6 +113,7 @@ def parse_must_visits(text: str) -> list[str]:
 
 
 def prefs_from_categories(selected: list[str]) -> dict:
+    # planner expects these keys; selected => 1.0 else 0.2
     base = 0.2
     return {
         "nature": 1.0 if "nature" in selected else base,
@@ -129,7 +136,10 @@ def reorder_with_must_visits(pois: list[dict], must_visits: list[str]) -> list[d
 
 def widget_key(prefix: str, row: pd.Series) -> str:
     # Unique even for repeated names like Starbucks
-    return f"{prefix}_{row.get('category','')}_{row.get('name','')}_{float(row.get('lat',0)):.5f}_{float(row.get('lon',0)):.5f}"
+    return (
+        f"{prefix}_{row.get('category','')}_{row.get('name','')}"
+        f"_{float(row.get('lat',0)):.5f}_{float(row.get('lon',0)):.5f}"
+    )
 
 
 def place_mask(df: pd.DataFrame, row: pd.Series):
@@ -282,58 +292,103 @@ df["include"] = False  # nothing auto-selected
 
 
 # ----------------------------
-# Browse UI
+# Browse UI (NEW: category tabs + paginated card grid)
 # ----------------------------
-st.subheader("🔎 Browse places")
-st.caption("Pick categories, search, then select places. Starbucks-like duplicates are handled correctly now.")
+st.subheader("🧩 Pick places by category")
+st.caption("Choose a category, search, then select places. Use Select/Clear to manage fast.")
 
-search = st.text_input("Search places (name/cuisine/description)", value="").strip().lower()
+search = st.text_input("Search (name / cuisine / description / hours)", value="").strip().lower()
 
 df_show = df.copy()
+df_show["category"] = df_show["category"].where(df_show["category"].isin(ALL_CATEGORIES), "other")
+
+# If user selected categories, restrict the browse list to those (otherwise show all)
 if selected_categories:
     df_show = df_show[df_show["category"].isin(selected_categories)].copy()
 
-if search:
+counts = df_show["category"].value_counts().to_dict()
+
+
+def cat_label(c: str) -> str:
+    return f"{c.capitalize()} ({counts.get(c, 0)})"
+
+
+cat_tabs = ["all"] + ALL_CATEGORIES + ["other"]
+tab_titles = [("All" if c == "all" else cat_label(c)) for c in cat_tabs]
+tabs = st.tabs(tab_titles)
+
+
+def apply_search(dfx: pd.DataFrame) -> pd.DataFrame:
+    if not search:
+        return dfx
+
     def _contains(row) -> bool:
-        blob = " ".join([
-            str(row.get("name", "")),
-            str(row.get("cuisine", "")),
-            str(row.get("description", "")),
-            str(row.get("opening_hours", "")),
-        ]).lower()
+        blob = " ".join(
+            [
+                str(row.get("name", "")),
+                str(row.get("cuisine", "")),
+                str(row.get("description", "")),
+                str(row.get("opening_hours", "")),
+            ]
+        ).lower()
         return search in blob
-    df_show = df_show[df_show.apply(_contains, axis=1)].copy()
+
+    return dfx[dfx.apply(_contains, axis=1)].copy()
 
 
-# 4 main categories in columns
-cols = st.columns(4)
-col_map = {0: "food", 1: "nature", 2: "museums", 3: "nightlife"}
+def render_category(dfx: pd.DataFrame, cat_key: str):
+    if dfx.empty:
+        st.info("No places in this category (try increasing radius or turning on Relax matching).")
+        return
 
-for i, cat in col_map.items():
-    with cols[i]:
-        st.markdown(f"### {cat.capitalize()}")
-        df_cat = df_show[df_show["category"] == cat].head(12).copy()
-        if df_cat.empty:
-            st.caption("No results")
-        else:
-            for _, r in df_cat.iterrows():
-                use = st.checkbox(f"Use: {r['name']}", key=widget_key("use", r))
-                df.loc[place_mask(df, r), "include"] = bool(use)
+    top = st.columns([1, 1, 2])
+    with top[0]:
+        if st.button("✅ Select all (this category)", key=f"select_all_{cat_key}"):
+            for _, r in dfx.iterrows():
+                df.loc[place_mask(df, r), "include"] = True
+            st.rerun()
 
+    with top[1]:
+        if st.button("🧹 Clear (this category)", key=f"clear_cat_{cat_key}"):
+            for _, r in dfx.iterrows():
+                df.loc[place_mask(df, r), "include"] = False
+            st.rerun()
 
-# Extra categories in tabs
-extra_tabs = st.tabs(["Coffee", "Shopping", "Viewpoints", "Events", "Other"])
-tab_cats = ["coffee", "shopping", "viewpoints", "events", "other"]
+    with top[2]:
+        st.caption("Tip: Search for keywords like “sushi”, “brewery”, “museum”, “viewpoint”, etc.")
 
-for tab, cat in zip(extra_tabs, tab_cats):
-    with tab:
-        df_cat = df_show[df_show["category"] == cat].copy()
-        st.caption(f"{len(df_cat)} places")
-        for _, r in df_cat.head(25).iterrows():
-            use = st.checkbox(f"Use: {r['name']}", key=widget_key("use", r))
+    st.markdown("---")
+
+    # Pagination to avoid long pages
+    page_size = 16
+    total = len(dfx)
+    max_pages = max(1, (total - 1) // page_size + 1)
+    page = st.number_input("Page", min_value=1, max_value=max_pages, value=1, step=1, key=f"page_{cat_key}")
+    start = (page - 1) * page_size
+    end = min(total, start + page_size)
+
+    st.caption(f"Showing {start + 1}-{end} of {total}")
+
+    left, right = st.columns(2)
+    for idx, (_, r) in enumerate(dfx.iloc[start:end].iterrows()):
+        col = left if idx % 2 == 0 else right
+        with col:
+            current = bool(df.loc[place_mask(df, r), "include"].values[0])
+            use = st.checkbox(f"Use: {r['name']}", value=current, key=widget_key("use", r))
             df.loc[place_mask(df, r), "include"] = bool(use)
             place_card(r)
             st.divider()
+
+
+for tab, cat in zip(tabs, cat_tabs):
+    with tab:
+        if cat == "all":
+            dfx = apply_search(df_show)
+            render_category(dfx, "all")
+        else:
+            dfx = df_show[df_show["category"] == cat].copy()
+            dfx = apply_search(dfx)
+            render_category(dfx, cat)
 
 
 # Selected summary + map
@@ -341,11 +396,17 @@ chosen_df = df[df["include"]].dropna(subset=["lat", "lon"]).copy()
 chosen_pois = chosen_df.to_dict("records")
 
 st.markdown("---")
-st.subheader("✅ Selected places")
+st.subheader("🧺 Selected places")
 st.write(f"Selected: **{len(chosen_pois)}**")
 
 if len(chosen_pois) > 0:
     st.map(pd.DataFrame([{"lat": p["lat"], "lon": p["lon"]} for p in chosen_pois]))
+
+    with st.expander("Manage selected places"):
+        for _, r in chosen_df.iterrows():
+            if st.button(f"Remove: {r['name']}", key=widget_key("rm", r)):
+                df.loc[place_mask(df, r), "include"] = False
+                st.rerun()
 else:
     st.info("Select a few places to build an itinerary.")
 
@@ -394,14 +455,16 @@ if generate:
 
         rows = []
         for i, e in enumerate(timeline, start=1):
-            rows.append({
-                "#": i,
-                "Time": f"{fmt_time(int(e['start_min']))} → {fmt_time(int(e['end_min']))}",
-                "Place": e["name"],
-                "Category": e["category"],
-                "Travel (mins)": int(e.get("travel_from_prev_mins", 0)),
-                "Est. Cost ($)": round(float(e.get("avg_cost", 0.0)), 2),
-            })
+            rows.append(
+                {
+                    "#": i,
+                    "Time": f"{fmt_time(int(e['start_min']))} → {fmt_time(int(e['end_min']))}",
+                    "Place": e["name"],
+                    "Category": e["category"],
+                    "Travel (mins)": int(e.get("travel_from_prev_mins", 0)),
+                    "Est. Cost ($)": round(float(e.get("avg_cost", 0.0)), 2),
+                }
+            )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         st.caption("Map links:")
@@ -419,7 +482,9 @@ if generate:
     pdf_bytes = itinerary_to_pdf(itinerary, title=f"Itinerary for {city_display or 'Trip'}")
     st.download_button("Download PDF", data=pdf_bytes, file_name=f"itinerary_{safe_city}.pdf", mime="application/pdf")
     ics_bytes = itinerary_to_ics(itinerary, trip_start_date=trip_start_date)
-    st.download_button("Download Calendar (.ics)", data=ics_bytes, file_name=f"itinerary_{safe_city}.ics", mime="text/calendar")
+    st.download_button(
+        "Download Calendar (.ics)", data=ics_bytes, file_name=f"itinerary_{safe_city}.ics", mime="text/calendar"
+    )
 
     with st.expander("🔧 Debug: Raw itinerary JSON"):
         st.json(itinerary)
