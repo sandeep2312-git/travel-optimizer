@@ -34,9 +34,6 @@ MODE_CONFIG = {
 }
 
 
-# ----------------------------
-# Page setup
-# ----------------------------
 st.set_page_config(page_title="AI Travel Optimizer", layout="wide")
 st.title("🧭 AI Travel Optimizer")
 st.caption("Pick what you want (no weights), then generate a simple schedule + map links + exports.")
@@ -133,9 +130,9 @@ def reorder_with_must_visits(pois: list[dict], must_visits: list[str]) -> list[d
     return sorted(pois, key=lambda p: hit(p.get("name", "")), reverse=True)
 
 
-# --- NEW: unique widget id ---
 def add_uid_column(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # include index so duplicates from Overpass still get distinct ids
     df["_uid"] = (
         df["name"].astype(str)
         + "|" + df["category"].astype(str)
@@ -146,8 +143,9 @@ def add_uid_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def widget_key(prefix: str, row: pd.Series) -> str:
-    return f"{prefix}_{row.get('_uid', '')}"
+def widget_key(prefix: str, scope: str, row: pd.Series) -> str:
+    # scope makes keys unique across tabs (all vs food vs nature etc.)
+    return f"{prefix}_{scope}_{row.get('_uid', '')}"
 
 
 def uid_mask(df: pd.DataFrame, row: pd.Series):
@@ -242,7 +240,6 @@ with st.sidebar:
     force_refresh = st.checkbox("Force refresh", value=False)
 
 
-# apply forced categories for special modes
 forced = MODE_CONFIG[mode]["force_categories"]
 if forced:
     if selected_categories:
@@ -296,87 +293,67 @@ if not pois:
 
 df = normalize_poi_defaults(pd.DataFrame(pois))
 df["category"] = df["category"].where(df["category"].isin(ALL_CATEGORIES), "other")
-df["include"] = False  # nothing auto-selected
-
-# add stable unique widget IDs
+df["include"] = False
 df = add_uid_column(df)
 
 
 # ----------------------------
-# Browse UI (Tabs + pagination)
+# Browse UI (tabs + pagination)
 # ----------------------------
 st.subheader("🧩 Pick places by category")
-st.caption("Choose a category, search, then select places. Use Select/Clear to manage fast.")
+st.caption("This fixes duplicate widget keys by scoping keys per tab (All vs Food etc.).")
 
 search = st.text_input("Search (name / cuisine / description / hours)", value="").strip().lower()
 
 df_show = df.copy()
 df_show["category"] = df_show["category"].where(df_show["category"].isin(ALL_CATEGORIES), "other")
-
-# If user selected categories, restrict the browse list to those (otherwise show all)
 if selected_categories:
     df_show = df_show[df_show["category"].isin(selected_categories)].copy()
 
-# IMPORTANT: remove duplicates so keys don't repeat
-df_show = df_show.drop_duplicates(subset=["name", "category", "lat", "lon"]).reset_index(drop=True)
-
 counts = df_show["category"].value_counts().to_dict()
-
-
 def cat_label(c: str) -> str:
     return f"{c.capitalize()} ({counts.get(c, 0)})"
-
 
 cat_tabs = ["all"] + ALL_CATEGORIES + ["other"]
 tab_titles = [("All" if c == "all" else cat_label(c)) for c in cat_tabs]
 tabs = st.tabs(tab_titles)
 
-
 def apply_search(dfx: pd.DataFrame) -> pd.DataFrame:
     if not search:
         return dfx
-
     def _contains(row) -> bool:
-        blob = " ".join(
-            [
-                str(row.get("name", "")),
-                str(row.get("cuisine", "")),
-                str(row.get("description", "")),
-                str(row.get("opening_hours", "")),
-            ]
-        ).lower()
+        blob = " ".join([
+            str(row.get("name", "")),
+            str(row.get("cuisine", "")),
+            str(row.get("description", "")),
+            str(row.get("opening_hours", "")),
+        ]).lower()
         return search in blob
-
     return dfx[dfx.apply(_contains, axis=1)].copy()
 
-
-def render_category(dfx: pd.DataFrame, cat_key: str):
+def render_category(dfx: pd.DataFrame, scope: str):
     if dfx.empty:
         st.info("No places in this category (try increasing radius or turning on Relax matching).")
         return
 
     top = st.columns([1, 1, 2])
     with top[0]:
-        if st.button("✅ Select all (this category)", key=f"select_all_{cat_key}"):
-            for _, r in dfx.iterrows():
-                df.loc[uid_mask(df, r), "include"] = True
+        if st.button("✅ Select all (this category)", key=f"select_all_{scope}"):
+            df.loc[df["_uid"].isin(dfx["_uid"]), "include"] = True
             st.rerun()
-
     with top[1]:
-        if st.button("🧹 Clear (this category)", key=f"clear_cat_{cat_key}"):
-            for _, r in dfx.iterrows():
-                df.loc[uid_mask(df, r), "include"] = False
+        if st.button("🧹 Clear (this category)", key=f"clear_cat_{scope}"):
+            df.loc[df["_uid"].isin(dfx["_uid"]), "include"] = False
             st.rerun()
-
     with top[2]:
-        st.caption("Tip: Search for keywords like “sushi”, “brewery”, “museum”, “viewpoint”, etc.")
+        st.caption("Tip: Search for “sushi”, “brewery”, “museum”, “viewpoint”, etc.")
 
     st.markdown("---")
 
     page_size = 16
     total = len(dfx)
     max_pages = max(1, (total - 1) // page_size + 1)
-    page = st.number_input("Page", min_value=1, max_value=max_pages, value=1, step=1, key=f"page_{cat_key}")
+    page = st.number_input("Page", min_value=1, max_value=max_pages, value=1, step=1, key=f"page_{scope}")
     start = (page - 1) * page_size
     end = min(total, start + page_size)
 
@@ -386,15 +363,18 @@ def render_category(dfx: pd.DataFrame, cat_key: str):
     for idx, (_, r) in enumerate(dfx.iloc[start:end].iterrows()):
         col = left if idx % 2 == 0 else right
         with col:
-            current_vals = df.loc[uid_mask(df, r), "include"].values
-            current = bool(current_vals[0]) if len(current_vals) else False
+            cur_vals = df.loc[uid_mask(df, r), "include"].values
+            current = bool(cur_vals[0]) if len(cur_vals) else False
 
-            use = st.checkbox(f"Use: {r['name']}", value=current, key=widget_key("use", r))
+            use = st.checkbox(
+                f"Use: {r['name']}",
+                value=current,
+                key=widget_key("use", scope, r),
+            )
             df.loc[uid_mask(df, r), "include"] = bool(use)
 
             place_card(r)
             st.divider()
-
 
 for tab, cat in zip(tabs, cat_tabs):
     with tab:
@@ -407,7 +387,9 @@ for tab, cat in zip(tabs, cat_tabs):
             render_category(dfx, cat)
 
 
+# ----------------------------
 # Selected summary + map
+# ----------------------------
 chosen_df = df[df["include"]].dropna(subset=["lat", "lon"]).copy()
 chosen_pois = chosen_df.to_dict("records")
 
@@ -417,10 +399,9 @@ st.write(f"Selected: **{len(chosen_pois)}**")
 
 if len(chosen_pois) > 0:
     st.map(pd.DataFrame([{"lat": p["lat"], "lon": p["lon"]} for p in chosen_pois]))
-
     with st.expander("Manage selected places"):
         for _, r in chosen_df.iterrows():
-            if st.button(f"Remove: {r['name']}", key=widget_key("rm", r)):
+            if st.button(f"Remove: {r['name']}", key=widget_key("rm", "selected", r)):
                 df.loc[uid_mask(df, r), "include"] = False
                 st.rerun()
 else:
@@ -471,16 +452,14 @@ if generate:
 
         rows = []
         for i, e in enumerate(timeline, start=1):
-            rows.append(
-                {
-                    "#": i,
-                    "Time": f"{fmt_time(int(e['start_min']))} → {fmt_time(int(e['end_min']))}",
-                    "Place": e["name"],
-                    "Category": e["category"],
-                    "Travel (mins)": int(e.get("travel_from_prev_mins", 0)),
-                    "Est. Cost ($)": round(float(e.get("avg_cost", 0.0)), 2),
-                }
-            )
+            rows.append({
+                "#": i,
+                "Time": f"{fmt_time(int(e['start_min']))} → {fmt_time(int(e['end_min']))}",
+                "Place": e["name"],
+                "Category": e["category"],
+                "Travel (mins)": int(e.get("travel_from_prev_mins", 0)),
+                "Est. Cost ($)": round(float(e.get("avg_cost", 0.0)), 2),
+            })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
         st.caption("Map links:")
@@ -497,6 +476,7 @@ if generate:
     safe_city = (city_display or "trip").replace(" ", "_").replace(",", "")
     pdf_bytes = itinerary_to_pdf(itinerary, title=f"Itinerary for {city_display or 'Trip'}")
     st.download_button("Download PDF", data=pdf_bytes, file_name=f"itinerary_{safe_city}.pdf", mime="application/pdf")
+
     ics_bytes = itinerary_to_ics(itinerary, trip_start_date=trip_start_date)
     st.download_button(
         "Download Calendar (.ics)", data=ics_bytes, file_name=f"itinerary_{safe_city}.ics", mime="text/calendar"
