@@ -8,26 +8,105 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.nchc.org.tw/api/interpreter",
 ]
 
+# Tags to fetch (Strict vs Relaxed)
 TAGS_STRICT = [
+    # Core
     "tourism=attraction",
     "tourism=museum",
     "leisure=park",
     "amenity=restaurant",
     "amenity=bar",
+
+    # New categories
+    "amenity=cafe",                # coffee
+    "shop=mall",                   # shopping
+    "shop=supermarket",            # shopping
+    "tourism=viewpoint",           # viewpoints
+    "tourism=gallery",             # museums-ish
 ]
 
-TAGS_RELAXED = [
-    "tourism=attraction",
-    "tourism=museum",
-    "leisure=park",
-    "amenity=restaurant",
-    "amenity=cafe",
-    "amenity=bar",
+TAGS_RELAXED = TAGS_STRICT + [
+    # More nightlife/food variants
     "amenity=pub",
-    "tourism=gallery",
-    "historic=memorial",
+    "amenity=fast_food",
+    "amenity=ice_cream",
+
+    # Shopping expansion
+    "shop=clothes",
+    "shop=department_store",
+    "shop=gift",
+    "shop=convenience",
+
+    # Nature expansion
+    "leisure=garden",
+    "leisure=nature_reserve",
+
+    # Events-ish (OSM doesn’t always tag events consistently; these help)
+    "amenity=theatre",
+    "amenity=cinema",
+    "amenity=arts_centre",
+
+    # Culture / sights
     "historic=monument",
+    "historic=memorial",
+    "tourism=information",
 ]
+
+# Category mapping rules (first match wins)
+def categorize(tags: dict) -> str:
+    amenity = tags.get("amenity")
+    tourism = tags.get("tourism")
+    leisure = tags.get("leisure")
+    shop = tags.get("shop")
+    historic = tags.get("historic")
+
+    # Food
+    if amenity in ("restaurant", "fast_food", "ice_cream"):
+        return "food"
+
+    # Coffee
+    if amenity == "cafe":
+        return "coffee"
+
+    # Nightlife
+    if amenity in ("bar", "pub"):
+        return "nightlife"
+
+    # Museums / culture
+    if tourism in ("museum", "gallery"):
+        return "museums"
+    if amenity in ("theatre", "cinema", "arts_centre"):
+        return "events"
+    if historic in ("monument", "memorial"):
+        return "museums"
+
+    # Nature
+    if leisure in ("park", "garden", "nature_reserve"):
+        return "nature"
+    if tourism == "attraction":
+        return "nature"
+
+    # Viewpoints
+    if tourism == "viewpoint":
+        return "viewpoints"
+
+    # Shopping
+    if shop in (
+        "mall",
+        "supermarket",
+        "clothes",
+        "department_store",
+        "gift",
+        "convenience",
+    ):
+        return "shopping"
+
+    # Events-ish
+    if tourism == "information":
+        return "events"
+
+    return "other"
+
 
 def _build_query(lat: float, lon: float, radius_m: int, tags: list[str], include_ways: bool) -> str:
     parts = []
@@ -49,6 +128,7 @@ def _build_query(lat: float, lon: float, radius_m: int, tags: list[str], include
 {out_stmt}
 """
 
+
 def _request_with_retries(url: str, query: str, max_tries: int = 2) -> dict:
     last_err = None
     for attempt in range(1, max_tries + 1):
@@ -61,6 +141,7 @@ def _request_with_retries(url: str, query: str, max_tries: int = 2) -> dict:
             time.sleep(min(6, (2 ** attempt) + random.random()))
     raise last_err
 
+
 def _try_endpoints(query: str) -> dict:
     last_err = None
     for endpoint in OVERPASS_ENDPOINTS:
@@ -69,6 +150,7 @@ def _try_endpoints(query: str) -> dict:
         except Exception as e:
             last_err = e
     raise last_err if last_err else RuntimeError("Overpass request failed")
+
 
 def _elements_to_pois(data: dict) -> list[dict]:
     pois = []
@@ -88,25 +170,15 @@ def _elements_to_pois(data: dict) -> list[dict]:
         if plat is None or plon is None:
             continue
 
-        category = "other"
-        if t.get("amenity") in ("restaurant", "cafe"):
-            category = "food"
-        elif t.get("amenity") in ("bar", "pub"):
-            category = "nightlife"
-        elif t.get("tourism") in ("museum", "gallery"):
-            category = "museums"
-        elif t.get("leisure") == "park":
-            category = "nature"
-        elif t.get("tourism") == "attraction":
-            category = "nature"
-        elif t.get("historic") in ("memorial", "monument"):
-            category = "museums"
+        category = categorize(t)
 
         pois.append({
             "name": name,
             "category": category,
             "lat": float(plat),
             "lon": float(plon),
+
+            # heuristic defaults (user can edit in UI)
             "avg_cost": 15,
             "visit_duration_mins": 90,
             "rating": 4.3,
@@ -124,44 +196,41 @@ def _elements_to_pois(data: dict) -> list[dict]:
 
     return uniq
 
+
 def fetch_pois(
     lat: float,
     lon: float,
-    radius_km: float = 6.0,
+    radius_km: float = 8.0,
     limit: int = 120,
     relaxed: bool = True,
 ) -> list[dict]:
     """
     Strategy:
-    1) Try nodes-only (fast)
-    2) If empty, try include ways/relations (more coverage)
-    3) If still empty, widen tags (relaxed=True)
+      1) Fast: nodes only
+      2) If empty/too small: include ways/relations (more coverage)
+      3) Try strict set as fallback
     """
-    radius_m = int(max(1000, min(20000, radius_km * 1000)))  # clamp 1..20km
     tags_primary = TAGS_RELAXED if relaxed else TAGS_STRICT
 
-    # 1) Fast: nodes only
+    # Overpass stability: keep radius sane
+    radius_m = int(max(1000, min(20000, radius_km * 1000)))  # 1..20 km
+
+    # 1) nodes-only (fast)
     q1 = _build_query(lat, lon, radius_m, tags_primary, include_ways=False)
     data1 = _try_endpoints(q1)
     pois1 = _elements_to_pois(data1)
-    if pois1:
+    if len(pois1) >= 10:
         return pois1[:limit]
 
-    # 2) More coverage: include ways/relations
+    # 2) include ways/relations (better coverage)
     q2 = _build_query(lat, lon, radius_m, tags_primary, include_ways=True)
     data2 = _try_endpoints(q2)
     pois2 = _elements_to_pois(data2)
-    if pois2:
+    if len(pois2) >= 10:
         return pois2[:limit]
 
-    # 3) Last resort: strict tags with ways/relations OFF then ON (sometimes helps)
-    q3 = _build_query(lat, lon, radius_m, TAGS_STRICT, include_ways=False)
+    # 3) last resort: strict tags
+    q3 = _build_query(lat, lon, radius_m, TAGS_STRICT, include_ways=True)
     data3 = _try_endpoints(q3)
     pois3 = _elements_to_pois(data3)
-    if pois3:
-        return pois3[:limit]
-
-    q4 = _build_query(lat, lon, radius_m, TAGS_STRICT, include_ways=True)
-    data4 = _try_endpoints(q4)
-    pois4 = _elements_to_pois(data4)
-    return pois4[:limit]
+    return pois3[:limit]
