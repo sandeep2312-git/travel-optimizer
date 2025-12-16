@@ -1,0 +1,7 @@
+[
+  {"name":"Denver Botanic Gardens","category":"nature","lat":39.7321,"lon":-104.9610,"avg_cost":18,"visit_duration_mins":120,"rating":4.7},
+  {"name":"Denver Art Museum","category":"museums","lat":39.7372,"lon":-104.9890,"avg_cost":20,"visit_duration_mins":150,"rating":4.6},
+  {"name":"Union Station","category":"food","lat":39.7527,"lon":-104.9992,"avg_cost":25,"visit_duration_mins":90,"rating":4.7},
+  {"name":"Red Rocks Park","category":"nature","lat":39.6654,"lon":-105.2057,"avg_cost":10,"visit_duration_mins":180,"rating":4.8},
+  {"name":"LoDo Night Out","category":"nightlife","lat":39.7549,"lon":-104.9965,"avg_cost":35,"visit_duration_mins":120,"rating":4.3}
+]
