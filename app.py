@@ -22,12 +22,30 @@ st.caption("A layman-friendly itinerary builder that balances **time, budget, di
 # ----------------------------
 @st.cache_data(show_spinner=False)
 def geocode_city(city: str):
-    geolocator = Nominatim(user_agent="travel-optimizer-app")
-    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
-    loc = geocode(city)
-    if not loc:
-        return None
-    return float(loc.latitude), float(loc.longitude)
+    """
+    Robust geocoding for Codespaces:
+    - Uses Nominatim via geopy
+    - Tries multiple query variants
+    - Retries a few times to handle transient failures/rate-limits
+    """
+    geolocator = Nominatim(user_agent="travel-optimizer-app (github-codespace)")
+    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.2)
+
+    queries = [
+        city.strip(),
+        f"{city.strip()}, USA",
+        f"{city.strip()}, United States",
+    ]
+
+    for q in queries:
+        for _ in range(3):  # retries
+            try:
+                loc = geocode(q)
+                if loc:
+                    return float(loc.latitude), float(loc.longitude)
+            except Exception:
+                pass
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -116,7 +134,7 @@ prefs = {"nature": nature, "food": food, "museums": museums, "nightlife": nightl
 
 
 # ----------------------------
-# Geocode
+# Geocode (with manual fallback)
 # ----------------------------
 coords = None
 if city.strip():
@@ -124,11 +142,16 @@ if city.strip():
         coords = geocode_city(city.strip())
 
 if not coords:
-    st.error("City not found. Try adding state/country (e.g., 'Austin, TX' or 'Paris, France').")
-    st.stop()
-
-lat, lon = coords
-st.success(f"Location found: **{city}**  (lat: {lat:.4f}, lon: {lon:.4f})")
+    st.warning("City lookup failed (geocoding). You can still continue by entering coordinates manually.")
+    c1, c2 = st.columns(2)
+    with c1:
+        lat = st.number_input("Latitude", value=39.7392, format="%.6f")
+    with c2:
+        lon = st.number_input("Longitude", value=-104.9903, format="%.6f")
+    st.info("Tip: In Google Maps, right-click → 'What's here?' to copy coordinates.")
+else:
+    lat, lon = coords
+    st.success(f"Location found: **{city}**  (lat: {lat:.4f}, lon: {lon:.4f})")
 
 
 # ----------------------------
