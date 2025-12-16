@@ -35,6 +35,9 @@ st.title("🧭 AI Travel Optimizer")
 st.caption("Pick what you want (no weights), then generate a simple schedule + map links + exports.")
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 @st.cache_data(show_spinner=False)
 def geocode_city(city: str):
     geolocator = Nominatim(user_agent="travel-optimizer-app (github-codespace)")
@@ -83,6 +86,7 @@ def normalize_poi_defaults(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["name", "lat", "lon"]).copy()
     df["lat"] = df["lat"].astype(float)
     df["lon"] = df["lon"].astype(float)
+
     return df
 
 
@@ -103,7 +107,6 @@ def parse_must_visits(text: str) -> list[str]:
 
 
 def prefs_from_categories(selected: list[str]) -> dict:
-    # Planner expects these 4 keys. Selected => 1.0 else 0.2
     base = 0.2
     return {
         "nature": 1.0 if "nature" in selected else base,
@@ -124,6 +127,15 @@ def reorder_with_must_visits(pois: list[dict], must_visits: list[str]) -> list[d
     return sorted(pois, key=lambda p: hit(p.get("name", "")), reverse=True)
 
 
+def widget_key(prefix: str, row: pd.Series) -> str:
+    # Unique even for repeated names like Starbucks
+    return f"{prefix}_{row.get('category','')}_{row.get('name','')}_{float(row.get('lat',0)):.5f}_{float(row.get('lon',0)):.5f}"
+
+
+def place_mask(df: pd.DataFrame, row: pd.Series):
+    return (df["name"] == row["name"]) & (df["lat"] == float(row["lat"])) & (df["lon"] == float(row["lon"]))
+
+
 def place_card(row: pd.Series):
     title = row["name"]
     cat = row["category"]
@@ -142,18 +154,18 @@ def place_card(row: pd.Series):
     if meta:
         st.caption(" | ".join(meta))
 
-    cols = st.columns(3)
-    with cols[0]:
+    c1, c2, c3 = st.columns(3)
+    with c1:
         st.caption(f"Est. cost: ${row['avg_cost']}")
-    with cols[1]:
+    with c2:
         st.caption(f"Time: {int(row['visit_duration_mins'])} mins")
-    with cols[2]:
+    with c3:
         st.caption(f"Rating: {row.get('rating', 4.3)}")
 
-    link_cols = st.columns(2)
-    with link_cols[0]:
+    b1, b2 = st.columns(2)
+    with b1:
         st.link_button("Open in Google Maps", f"https://www.google.com/maps/search/?api=1&query={row['lat']},{row['lon']}")
-    with link_cols[1]:
+    with b2:
         if website:
             st.link_button("Website", website)
 
@@ -196,16 +208,7 @@ with st.sidebar:
 
     st.divider()
     st.header("3) What do you want?")
-    # Default: EMPTY (user chooses)
     selected_categories = st.multiselect("Choose categories", options=ALL_CATEGORIES, default=[])
-
-    b1, b2 = st.columns(2)
-    with b1:
-        if st.button("Select all"):
-            selected_categories = ALL_CATEGORIES.copy()
-    with b2:
-        if st.button("Select none"):
-            selected_categories = []
 
     st.divider()
     st.header("4) Must-visit places")
@@ -221,9 +224,9 @@ with st.sidebar:
     force_refresh = st.checkbox("Force refresh", value=False)
 
 
+# apply forced categories for special modes
 forced = MODE_CONFIG[mode]["force_categories"]
 if forced:
-    # For special modes, restrict categories
     if selected_categories:
         selected_categories = [c for c in selected_categories if c in forced]
     if not selected_categories:
@@ -275,23 +278,21 @@ if not pois:
 
 df = normalize_poi_defaults(pd.DataFrame(pois))
 df["category"] = df["category"].where(df["category"].isin(ALL_CATEGORIES), "other")
-df["include"] = False  # IMPORTANT: nothing auto-selected
+df["include"] = False  # nothing auto-selected
 
 
 # ----------------------------
 # Browse UI
 # ----------------------------
 st.subheader("🔎 Browse places")
-st.caption("Tip: Pick categories first, then use Search to quickly find places.")
+st.caption("Pick categories, search, then select places. Starbucks-like duplicates are handled correctly now.")
 
 search = st.text_input("Search places (name/cuisine/description)", value="").strip().lower()
 
-# Filter by category selection (if user selected categories)
 df_show = df.copy()
 if selected_categories:
     df_show = df_show[df_show["category"].isin(selected_categories)].copy()
 
-# Search filter
 if search:
     def _contains(row) -> bool:
         blob = " ".join([
@@ -303,22 +304,22 @@ if search:
         return search in blob
     df_show = df_show[df_show.apply(_contains, axis=1)].copy()
 
-# Layout: category columns (easy)
+
+# 4 main categories in columns
 cols = st.columns(4)
 col_map = {0: "food", 1: "nature", 2: "museums", 3: "nightlife"}
 
 for i, cat in col_map.items():
     with cols[i]:
         st.markdown(f"### {cat.capitalize()}")
-        df_cat = df_show[df_show["category"] == cat].head(10).copy()
+        df_cat = df_show[df_show["category"] == cat].head(12).copy()
         if df_cat.empty:
             st.caption("No results")
         else:
             for _, r in df_cat.iterrows():
-                use = st.checkbox(f"Use: {r['name']}", key=f"use_{cat}_{r['name']}")
-                if use:
-                    # mark include in master df by name
-                    df.loc[df["name"] == r["name"], "include"] = True
+                use = st.checkbox(f"Use: {r['name']}", key=widget_key("use", r))
+                df.loc[place_mask(df, r), "include"] = bool(use)
+
 
 # Extra categories in tabs
 extra_tabs = st.tabs(["Coffee", "Shopping", "Viewpoints", "Events", "Other"])
@@ -328,13 +329,12 @@ for tab, cat in zip(extra_tabs, tab_cats):
     with tab:
         df_cat = df_show[df_show["category"] == cat].copy()
         st.caption(f"{len(df_cat)} places")
-        # show as cards with include toggle
-        for _, r in df_cat.head(20).iterrows():
-            use = st.checkbox(f"Use: {r['name']}", key=f"use_{cat}_{r['name']}")
-            if use:
-                df.loc[df["name"] == r["name"], "include"] = True
+        for _, r in df_cat.head(25).iterrows():
+            use = st.checkbox(f"Use: {r['name']}", key=widget_key("use", r))
+            df.loc[place_mask(df, r), "include"] = bool(use)
             place_card(r)
             st.divider()
+
 
 # Selected summary + map
 chosen_df = df[df["include"]].dropna(subset=["lat", "lon"]).copy()
