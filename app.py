@@ -1,4 +1,3 @@
-import time
 import pandas as pd
 import streamlit as st
 from geopy.geocoders import Nominatim
@@ -13,18 +12,14 @@ from src.poi_sources_overpass import fetch_pois
 # ----------------------------
 st.set_page_config(page_title="AI Travel Optimizer", layout="wide")
 st.title("🧭 AI Travel Optimizer")
-st.caption("Build a day-by-day itinerary that balances **time, budget, and your interests**.")
+st.caption("A layman-friendly itinerary builder that balances **time, budget, distance, and your interests**.")
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
 @st.cache_data(show_spinner=False)
-def geocode_city(city: str) -> tuple[float, float] | None:
-    """
-    Uses Nominatim (OpenStreetMap geocoder) via geopy.
-    Cached to avoid re-geocoding the same city repeatedly.
-    """
+def geocode_city(city: str):
     geolocator = Nominatim(user_agent="travel-optimizer-app")
     geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
     loc = geocode(city)
@@ -33,28 +28,12 @@ def geocode_city(city: str) -> tuple[float, float] | None:
     return float(loc.latitude), float(loc.longitude)
 
 
-def explain_plan(itinerary: dict, prefs: dict, pace: str) -> str:
-    # Simple rule-based explanation for laymen
-    if not itinerary["days"]:
-        return "I couldn’t build an itinerary with the current constraints. Try increasing budget, radius, or choosing a relaxed pace."
-
-    # dominant preference
-    top_pref = max(prefs.items(), key=lambda x: x[1])[0]
-    total_days = len(itinerary["days"])
-    total_cost = itinerary.get("total_cost", 0)
-    remaining = itinerary.get("remaining_budget", 0)
-
-    return (
-        f"This itinerary is optimized for a **{pace}** pace and prioritizes **{top_pref}** based on your interest sliders. "
-        f"It spreads activities across **{total_days} day(s)** while keeping you within your budget. "
-        f"Estimated spend is **${total_cost}**, leaving about **${remaining}** as buffer for meals, tickets, or surprises."
-    )
+@st.cache_data(show_spinner=False)
+def load_pois_cached(lat: float, lon: float, radius_km: float, limit: int):
+    return fetch_pois(lat=lat, lon=lon, radius_km=radius_km, limit=limit)
 
 
 def normalize_poi_defaults(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure columns exist + clean types so planner doesn't break.
-    """
     for col, default in [
         ("avg_cost", 15),
         ("visit_duration_mins", 90),
@@ -64,38 +43,66 @@ def normalize_poi_defaults(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = default
 
+    df["name"] = df["name"].astype(str)
     df["avg_cost"] = pd.to_numeric(df["avg_cost"], errors="coerce").fillna(15).astype(float)
     df["visit_duration_mins"] = pd.to_numeric(df["visit_duration_mins"], errors="coerce").fillna(90).astype(int)
     df["rating"] = pd.to_numeric(df["rating"], errors="coerce").fillna(4.3).astype(float)
     df["category"] = df["category"].fillna("other").astype(str)
 
-    # keep only usable rows
-    df = df.dropna(subset=["name", "lat", "lon"]).copy()
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    df = df.dropna(subset=["lat", "lon"]).copy()
+    df = df.dropna(subset=["name", "lat", "lon"]).copy()
     df["lat"] = df["lat"].astype(float)
     df["lon"] = df["lon"].astype(float)
+
     return df
 
 
+def fmt_time(mins: int) -> str:
+    h = (mins // 60) % 24
+    m = mins % 60
+    ampm = "AM" if h < 12 else "PM"
+    hh = h if 1 <= h <= 12 else (12 if h == 0 else h - 12)
+    return f"{hh}:{m:02d} {ampm}"
+
+
+def explain_plan(itinerary: dict, prefs: dict, pace: str, travel_mode: str) -> str:
+    if not itinerary.get("days"):
+        return "I couldn’t build an itinerary with the current constraints. Try selecting more places, increasing budget, or choosing a relaxed pace."
+
+    top_pref = max(prefs.items(), key=lambda x: x[1])[0]
+    total_days = len(itinerary["days"])
+    total_cost = itinerary.get("total_cost", 0)
+    remaining = itinerary.get("remaining_budget", 0)
+
+    return (
+        f"This plan uses **{travel_mode}** travel mode and a **{pace}** pace. "
+        f"It prioritizes **{top_pref}** based on your sliders and tries to keep stops **closer together** to reduce travel time. "
+        f"Estimated spend is **${total_cost}**, leaving **${remaining}** buffer for meals, tickets, and extras."
+    )
+
+
 # ----------------------------
-# Sidebar: Step 1 - Trip inputs
+# Sidebar: Inputs
 # ----------------------------
 with st.sidebar:
     st.header("1) Trip Inputs")
-
     city = st.text_input("City", value="Denver, CO")
     days = st.slider("Number of days", 1, 7, 3)
     budget = st.number_input("Total budget ($)", min_value=0, value=400, step=50)
 
-    radius_km = st.slider("Search radius (km)", 2, 30, 8)
-    max_pois = st.slider("Max places to load", 30, 250, 120, step=10)
-
+    start_hour = st.slider("Day starts at", 6, 12, 10)
     pace = st.selectbox("Pace", ["relaxed", "moderate", "packed"], index=1)
+    travel_mode = st.selectbox("Travel mode", ["drive", "transit", "walk"], index=0)
 
     st.divider()
-    st.header("2) Interests (weights)")
+    st.header("2) Place Search")
+    radius_km = st.slider("Search radius (km)", 2, 30, 8)
+    max_pois = st.slider("Max places to load", 30, 250, 120, step=10)
+    force_refresh = st.checkbox("Force refresh places (ignore cache)", value=False)
+
+    st.divider()
+    st.header("3) Interests (weights)")
     nature = st.slider("Nature", 0.0, 1.0, 0.6)
     food = st.slider("Food", 0.0, 1.0, 0.6)
     museums = st.slider("Museums", 0.0, 1.0, 0.4)
@@ -105,7 +112,7 @@ prefs = {"nature": nature, "food": food, "museums": museums, "nightlife": nightl
 
 
 # ----------------------------
-# Main: Step 1 - Geocode city
+# Geocode
 # ----------------------------
 coords = None
 if city.strip():
@@ -113,7 +120,7 @@ if city.strip():
         coords = geocode_city(city.strip())
 
 if not coords:
-    st.error("I couldn't find that city. Try adding state/country (e.g., 'Austin, TX' or 'Paris, France').")
+    st.error("City not found. Try adding state/country (e.g., 'Austin, TX' or 'Paris, France').")
     st.stop()
 
 lat, lon = coords
@@ -121,11 +128,14 @@ st.success(f"Location found: **{city}**  (lat: {lat:.4f}, lon: {lon:.4f})")
 
 
 # ----------------------------
-# Main: Step 2 - Load POIs
+# Load POIs
 # ----------------------------
-with st.spinner("Loading places near you (OpenStreetMap)…"):
+with st.spinner("Loading places nearby (OpenStreetMap)…"):
     try:
-        pois = fetch_pois(lat=lat, lon=lon, radius_km=float(radius_km), limit=int(max_pois))
+        if force_refresh:
+            pois = fetch_pois(lat=lat, lon=lon, radius_km=float(radius_km), limit=int(max_pois))
+        else:
+            pois = load_pois_cached(lat=lat, lon=lon, radius_km=float(radius_km), limit=int(max_pois))
     except Exception as e:
         st.error(f"Failed to load places. Error: {e}")
         st.stop()
@@ -139,12 +149,12 @@ df_pois["include"] = True
 
 
 # ----------------------------
-# Main: Step 3 - Let user curate POIs
+# Curate POIs
 # ----------------------------
-st.subheader("✅ Pick the places you want the optimizer to consider")
-st.caption("Tip: Uncheck items you don’t like, or adjust cost/time to match your style.")
+st.subheader("✅ Pick the places the optimizer can use")
+st.caption("Uncheck places you don’t like. You can also tweak time/cost so the schedule matches reality.")
 
-# Simple filters
+# Filters
 c1, c2, c3 = st.columns(3)
 with c1:
     category_filter = st.multiselect(
@@ -176,21 +186,25 @@ edited = st.data_editor(
     key="poi_editor",
 )
 
-# Apply edits back to df_view then build chosen POIs
+# Apply edits back
 df_view.loc[:, "include"] = edited["include"].values
 df_view.loc[:, "avg_cost"] = edited["avg_cost"].values
 df_view.loc[:, "visit_duration_mins"] = edited["visit_duration_mins"].values
 df_view.loc[:, "rating"] = edited["rating"].values
 
 chosen_df = df_view[df_view["include"]].copy()
-chosen_pois = chosen_df.merge(df_pois[["name", "lat", "lon"]], on="name", how="left").to_dict("records")
 
+# Preserve lat/lon (in case view lost them)
+chosen_df = chosen_df.merge(df_pois[["name", "lat", "lon"]], on="name", how="left", suffixes=("", "_orig"))
+chosen_df["lat"] = chosen_df["lat"].fillna(chosen_df.get("lat_orig"))
+chosen_df["lon"] = chosen_df["lon"].fillna(chosen_df.get("lon_orig"))
+
+chosen_pois = chosen_df[["name", "category", "avg_cost", "visit_duration_mins", "rating", "lat", "lon"]].to_dict("records")
 st.write(f"Places selected: **{len(chosen_pois)}**")
-
 
 # Map preview
 st.subheader("🗺 Map preview of selected places")
-map_df = pd.DataFrame([{"lat": p["lat"], "lon": p["lon"]} for p in chosen_pois if "lat" in p and "lon" in p])
+map_df = pd.DataFrame([{"lat": p["lat"], "lon": p["lon"]} for p in chosen_pois])
 if not map_df.empty:
     st.map(map_df)
 else:
@@ -198,7 +212,7 @@ else:
 
 
 # ----------------------------
-# Main: Step 4 - Build itinerary
+# Generate
 # ----------------------------
 st.subheader("📅 Generate itinerary")
 generate = st.button("Build my itinerary", type="primary")
@@ -208,49 +222,58 @@ if generate:
         st.warning("Select at least ~5 places so the planner has enough options.")
         st.stop()
 
-    with st.spinner("Optimizing your itinerary..."):
+    with st.spinner("Optimizing your itinerary (including travel time)..."):
         itinerary = plan_itinerary(
             pois=chosen_pois,
             days=int(days),
             budget=float(budget),
             prefs=prefs,
             pace=pace,
+            start_hour=int(start_hour),
+            travel_mode=travel_mode,
         )
 
     # Summary metrics
     m1, m2, m3 = st.columns(3)
     m1.metric("Estimated Total Cost", f"${itinerary.get('total_cost', 0)}")
     m2.metric("Remaining Budget", f"${itinerary.get('remaining_budget', 0)}")
-    m3.metric("Total Activity Time", f"{itinerary.get('total_time_mins', 0)} mins")
+    m3.metric("Total Time (activities + travel)", f"{itinerary.get('total_time_mins', 0)} mins")
 
-    st.info(explain_plan(itinerary, prefs, pace))
+    st.info(explain_plan(itinerary, prefs, pace, travel_mode))
 
-    # Itinerary cards
-    for day in itinerary["days"]:
+    # Display by day: timeline table + cards
+    for day in itinerary.get("days", []):
         st.markdown("---")
         st.subheader(f"Day {day['day']}  •  Cost: ${day['day_cost']}  •  Time: {day['day_time_mins']} mins")
 
-        if not day["items"]:
+        timeline = day.get("timeline", [])
+        if not timeline:
             st.warning("No activities selected for this day. Try relaxing constraints or selecting more places.")
             continue
 
-        for i, poi in enumerate(day["items"], start=1):
-            name = poi.get("name", "Unknown")
-            cat = poi.get("category", "other")
-            cost = poi.get("avg_cost", 0)
-            dur = poi.get("visit_duration_mins", 60)
-            plat, plon = poi.get("lat"), poi.get("lon")
+        # Timeline table (layman-friendly)
+        rows = []
+        for i, e in enumerate(timeline, start=1):
+            rows.append({
+                "#": i,
+                "Time": f"{fmt_time(int(e['start_min']))} → {fmt_time(int(e['end_min']))}",
+                "Place": e["name"],
+                "Category": e["category"],
+                "Travel from prev (mins)": int(e.get("travel_from_prev_mins", 0)),
+                "Travel from prev (km)": round(float(e.get("travel_from_prev_km", 0.0)), 2),
+                "Est. Cost ($)": round(float(e.get("avg_cost", 0.0)), 2),
+            })
 
-            with st.container(border=True):
-                st.markdown(f"**{i}. {name}**")
-                st.write(f"Category: `{cat}`")
-                st.write(f"⏱ Time: **{dur} mins**   •   💵 Est. cost: **${cost}**")
-                if plat is not None and plon is not None:
-                    st.link_button(
-                        "Open in Google Maps",
-                        f"https://www.google.com/maps/search/?api=1&query={plat},{plon}"
-                    )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    st.markdown("---")
+        # Action buttons (maps)
+        st.caption("Map links:")
+        for i, e in enumerate(timeline, start=1):
+            lat_e, lon_e = e.get("lat"), e.get("lon")
+            if lat_e is None or lon_e is None:
+                continue
+            st.link_button(f"Open {i}. {e['name']} in Google Maps",
+                           f"https://www.google.com/maps/search/?api=1&query={lat_e},{lon_e}")
+
     with st.expander("🔧 Debug: Raw itinerary JSON"):
         st.json(itinerary)
