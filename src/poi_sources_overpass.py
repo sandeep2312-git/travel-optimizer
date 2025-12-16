@@ -2,8 +2,15 @@ import requests
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-def build_query(lat: float, lon: float, radius_m: int, tags: list[str]) -> str:
-    # tags examples: ['tourism=attraction', 'amenity=restaurant', 'tourism=museum', 'leisure=park']
+def _build_query(lat: float, lon: float, radius_m: int) -> str:
+    tags = [
+        "tourism=attraction",
+        "tourism=museum",
+        "leisure=park",
+        "amenity=restaurant",
+        "amenity=bar",
+    ]
+
     parts = []
     for t in tags:
         k, v = t.split("=", 1)
@@ -20,13 +27,7 @@ def build_query(lat: float, lon: float, radius_m: int, tags: list[str]) -> str:
     """
 
 def fetch_pois(lat: float, lon: float, radius_km: float = 8.0, limit: int = 120) -> list[dict]:
-    tags = [
-        "tourism=attraction",
-        "tourism=museum",
-        "leisure=park",
-        "amenity=restaurant",
-    ]
-    q = build_query(lat, lon, int(radius_km * 1000), tags)
+    q = _build_query(lat, lon, int(radius_km * 1000))
     r = requests.post(OVERPASS_URL, data={"data": q}, timeout=40)
     r.raise_for_status()
     data = r.json()
@@ -38,7 +39,6 @@ def fetch_pois(lat: float, lon: float, radius_km: float = 8.0, limit: int = 120)
         if not name:
             continue
 
-        # coordinates: node has lat/lon, way/relation has center
         if "lat" in el and "lon" in el:
             plat, plon = el["lat"], el["lon"]
         else:
@@ -47,23 +47,24 @@ def fetch_pois(lat: float, lon: float, radius_km: float = 8.0, limit: int = 120)
         if plat is None or plon is None:
             continue
 
-        # map tags → our categories
         category = "other"
         if tags.get("amenity") == "restaurant":
             category = "food"
+        elif tags.get("amenity") == "bar":
+            category = "nightlife"
         elif tags.get("tourism") == "museum":
             category = "museums"
         elif tags.get("leisure") == "park":
             category = "nature"
         elif tags.get("tourism") == "attraction":
-            category = "nature"  # you can refine later
+            category = "nature"
 
         pois.append({
             "name": name,
             "category": category,
             "lat": float(plat),
             "lon": float(plon),
-            "avg_cost": 15,               # heuristic defaults (improve later)
+            "avg_cost": 15,
             "visit_duration_mins": 90,
             "rating": 4.3
         })
