@@ -1,4 +1,5 @@
-import time, random, json, os
+import time
+import random
 import requests
 
 OVERPASS_ENDPOINTS = [
@@ -7,7 +8,7 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.nchc.org.tw/api/interpreter",
 ]
 
-DEFAULT_TAGS = [
+TAGS_STRICT = [
     "tourism=attraction",
     "tourism=museum",
     "leisure=park",
@@ -15,25 +16,44 @@ DEFAULT_TAGS = [
     "amenity=bar",
 ]
 
-def _build_query_nodes_only(lat: float, lon: float, radius_m: int, tags: list[str]) -> str:
-    # nodes-only is MUCH faster than node+way+relation
+TAGS_RELAXED = [
+    "tourism=attraction",
+    "tourism=museum",
+    "leisure=park",
+    "amenity=restaurant",
+    "amenity=cafe",
+    "amenity=bar",
+    "amenity=pub",
+    "tourism=gallery",
+    "historic=memorial",
+    "historic=monument",
+]
+
+def _build_query(lat: float, lon: float, radius_m: int, tags: list[str], include_ways: bool) -> str:
     parts = []
     for t in tags:
         k, v = t.split("=", 1)
         parts.append(f'node(around:{radius_m},{lat},{lon})["{k}"="{v}"];')
+        if include_ways:
+            parts.append(f'way(around:{radius_m},{lat},{lon})["{k}"="{v}"];')
+            parts.append(f'relation(around:{radius_m},{lat},{lon})["{k}"="{v}"];')
+
+    out_stmt = "out tags;" if not include_ways else "out tags center;"
+    timeout = 20 if not include_ways else 25
+
     return f"""
-[out:json][timeout:20];
+[out:json][timeout:{timeout}];
 (
   {''.join(parts)}
 );
-out tags;
+{out_stmt}
 """
 
 def _request_with_retries(url: str, query: str, max_tries: int = 2) -> dict:
     last_err = None
     for attempt in range(1, max_tries + 1):
         try:
-            r = requests.post(url, data={"data": query}, timeout=30)
+            r = requests.post(url, data={"data": query}, timeout=35)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -41,45 +61,46 @@ def _request_with_retries(url: str, query: str, max_tries: int = 2) -> dict:
             time.sleep(min(6, (2 ** attempt) + random.random()))
     raise last_err
 
-def fetch_pois(lat: float, lon: float, radius_km: float = 4.0, limit: int = 120, tags: list[str] | None = None) -> list[dict]:
-    tags = tags or DEFAULT_TAGS
-    radius_m = int(max(1000, min(15000, radius_km * 1000)))  # clamp 1..15km
-    query = _build_query_nodes_only(lat, lon, radius_m, tags)
-
-    data = None
+def _try_endpoints(query: str) -> dict:
     last_err = None
     for endpoint in OVERPASS_ENDPOINTS:
         try:
-            data = _request_with_retries(endpoint, query, max_tries=2)
-            if data:
-                break
+            return _request_with_retries(endpoint, query, max_tries=2)
         except Exception as e:
             last_err = e
+    raise last_err if last_err else RuntimeError("Overpass request failed")
 
-    if data is None:
-        raise last_err if last_err else RuntimeError("Overpass request failed")
-
+def _elements_to_pois(data: dict) -> list[dict]:
     pois = []
     for el in data.get("elements", []):
         t = el.get("tags", {}) or {}
         name = t.get("name")
         if not name:
             continue
-        plat, plon = el.get("lat"), el.get("lon")
+
+        # node has lat/lon; ways/relations have center
+        if "lat" in el and "lon" in el:
+            plat, plon = el["lat"], el["lon"]
+        else:
+            c = el.get("center") or {}
+            plat, plon = c.get("lat"), c.get("lon")
+
         if plat is None or plon is None:
             continue
 
         category = "other"
-        if t.get("amenity") == "restaurant":
+        if t.get("amenity") in ("restaurant", "cafe"):
             category = "food"
-        elif t.get("amenity") == "bar":
+        elif t.get("amenity") in ("bar", "pub"):
             category = "nightlife"
-        elif t.get("tourism") == "museum":
+        elif t.get("tourism") in ("museum", "gallery"):
             category = "museums"
         elif t.get("leisure") == "park":
             category = "nature"
         elif t.get("tourism") == "attraction":
             category = "nature"
+        elif t.get("historic") in ("memorial", "monument"):
+            category = "museums"
 
         pois.append({
             "name": name,
@@ -101,4 +122,46 @@ def fetch_pois(lat: float, lon: float, radius_km: float = 4.0, limit: int = 120,
         seen.add(key)
         uniq.append(p)
 
-    return uniq[:limit]
+    return uniq
+
+def fetch_pois(
+    lat: float,
+    lon: float,
+    radius_km: float = 6.0,
+    limit: int = 120,
+    relaxed: bool = True,
+) -> list[dict]:
+    """
+    Strategy:
+    1) Try nodes-only (fast)
+    2) If empty, try include ways/relations (more coverage)
+    3) If still empty, widen tags (relaxed=True)
+    """
+    radius_m = int(max(1000, min(20000, radius_km * 1000)))  # clamp 1..20km
+    tags_primary = TAGS_RELAXED if relaxed else TAGS_STRICT
+
+    # 1) Fast: nodes only
+    q1 = _build_query(lat, lon, radius_m, tags_primary, include_ways=False)
+    data1 = _try_endpoints(q1)
+    pois1 = _elements_to_pois(data1)
+    if pois1:
+        return pois1[:limit]
+
+    # 2) More coverage: include ways/relations
+    q2 = _build_query(lat, lon, radius_m, tags_primary, include_ways=True)
+    data2 = _try_endpoints(q2)
+    pois2 = _elements_to_pois(data2)
+    if pois2:
+        return pois2[:limit]
+
+    # 3) Last resort: strict tags with ways/relations OFF then ON (sometimes helps)
+    q3 = _build_query(lat, lon, radius_m, TAGS_STRICT, include_ways=False)
+    data3 = _try_endpoints(q3)
+    pois3 = _elements_to_pois(data3)
+    if pois3:
+        return pois3[:limit]
+
+    q4 = _build_query(lat, lon, radius_m, TAGS_STRICT, include_ways=True)
+    data4 = _try_endpoints(q4)
+    pois4 = _elements_to_pois(data4)
+    return pois4[:limit]

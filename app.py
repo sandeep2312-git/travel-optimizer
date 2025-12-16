@@ -56,8 +56,9 @@ def geocode_city(city: str):
 
 
 @st.cache_data(show_spinner=False)
-def load_pois_cached(lat: float, lon: float, radius_km: float, limit: int):
-    return fetch_pois(lat=lat, lon=lon, radius_km=radius_km, limit=limit)
+def load_pois_cached(lat: float, lon: float, radius_km: float, limit: int, relaxed: bool):
+    # IMPORTANT: uses relaxed tags + fallback strategy inside poi_sources_overpass.py
+    return fetch_pois(lat=lat, lon=lon, radius_km=radius_km, limit=limit, relaxed=relaxed)
 
 
 def normalize_poi_defaults(df: pd.DataFrame) -> pd.DataFrame:
@@ -98,7 +99,6 @@ def explain_plan(itinerary: dict, prefs: dict, pace: str, travel_mode: str) -> s
         return "I couldn’t build an itinerary with the current constraints. Try selecting more places, increasing budget, or choosing a relaxed pace."
 
     top_pref = max(prefs.items(), key=lambda x: x[1])[0]
-    total_days = len(itinerary["days"])
     total_cost = itinerary.get("total_cost", 0)
     remaining = itinerary.get("remaining_budget", 0)
 
@@ -127,8 +127,9 @@ with st.sidebar:
 
     st.divider()
     st.header("2) Place Search")
-    radius_km = st.slider("Search radius (km)", 2, 30, 6)
+    radius_km = st.slider("Search radius (km)", 2, 30, 10)  # a bit higher helps Denver
     max_pois = st.slider("Max places to load", 30, 250, 120, step=10)
+    relaxed_tags = st.checkbox("Relax place matching (recommended)", value=True)
     force_refresh = st.checkbox("Force refresh places (ignore cache)", value=False)
 
     st.divider()
@@ -142,7 +143,7 @@ prefs = {"nature": nature, "food": food, "museums": museums, "nightlife": nightl
 
 
 # ----------------------------
-# Geocode (preset -> geocode -> manual)
+# Location: preset -> geocode -> manual
 # ----------------------------
 coords = None
 city_display = city.strip()
@@ -169,20 +170,39 @@ else:
 
 
 # ----------------------------
-# Load POIs
+# Load POIs (Overpass)
 # ----------------------------
 with st.spinner("Loading places nearby (OpenStreetMap)…"):
     try:
         if force_refresh:
-            pois = fetch_pois(lat=lat, lon=lon, radius_km=float(radius_km), limit=int(max_pois))
+            pois = fetch_pois(
+                lat=float(lat),
+                lon=float(lon),
+                radius_km=float(radius_km),
+                limit=int(max_pois),
+                relaxed=bool(relaxed_tags),
+            )
         else:
-            pois = load_pois_cached(lat=lat, lon=lon, radius_km=float(radius_km), limit=int(max_pois))
+            pois = load_pois_cached(
+                lat=float(lat),
+                lon=float(lon),
+                radius_km=float(radius_km),
+                limit=int(max_pois),
+                relaxed=bool(relaxed_tags),
+            )
     except Exception as e:
-        st.error(f"Failed to load places. Error: {e}")
+        st.error(f"Failed to load places. Try reducing radius / max places. Error: {e}")
         st.stop()
 
 if not pois:
-    st.warning("No places found. Try reducing radius or changing the city.")
+    st.warning("No places found.")
+    st.info(
+        "Try this:\n"
+        "- Increase radius to 12–20 km\n"
+        "- Turn ON “Relax place matching”\n"
+        "- Reduce max places to 80–120\n"
+        "- Click “Force refresh places”"
+    )
     st.stop()
 
 df_pois = normalize_poi_defaults(pd.DataFrame(pois))
@@ -242,7 +262,6 @@ if "lon_orig" in chosen_df.columns:
 chosen_df = chosen_df.dropna(subset=["lat", "lon"]).copy()
 
 chosen_pois = chosen_df[["name", "category", "avg_cost", "visit_duration_mins", "rating", "lat", "lon"]].to_dict("records")
-
 st.write(f"Places selected: {len(chosen_pois)}")
 
 
@@ -284,7 +303,7 @@ if generate:
 
     st.info(explain_plan(itinerary, prefs, pace, travel_mode), icon="ℹ️")
 
-    # quick sanity debug (optional)
+    # Timeline sanity debug (optional)
     with_coords = sum(
         1
         for d in itinerary.get("days", [])
@@ -325,7 +344,7 @@ if generate:
             any_link = True
             st.link_button(
                 f"Open {i}. {e['name']} in Google Maps",
-                f"https://www.google.com/maps/search/?api=1&query={lat_e},{lon_e}"
+                f"https://www.google.com/maps/search/?api=1&query={lat_e},{lon_e}",
             )
         if not any_link:
             st.info("No map links available (missing coordinates). Try selecting different places or reducing filters.")
